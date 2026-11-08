@@ -14,6 +14,7 @@ exec < /dev/null
 # === КОНФИГУРАЦИЯ ===
 RETENTION_DAYS=30
 
+# Последний результат синхронизации хранится на Omega и отправляется на эти ноды.
 ALERT_NODES=("xi.lan" "sigma.lan")
 ALERT_FILE="/var/log/incus-backup-alert.txt"
 
@@ -45,14 +46,37 @@ if ! flock -n 9; then
     exit 1
 fi
 
+# Пишем сообщение с меткой времени в журнал синхронизации и вывод запуска.
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
 }
 
+# При запуске через симлинк ищем функции оповещения рядом с оригиналом скрипта.
+if ! script_path=$(readlink -f -- "${BASH_SOURCE[0]}"); then
+    log "ОШИБКА: Не удалось определить путь к скрипту."
+    exit 2
+fi
+script_directory=${script_path%/*}
+if ! source "$script_directory/incus-backup-status.sh"; then
+    log "ОШИБКА: Не удалось загрузить функции оповещения."
+    exit 2
+fi
+
+# Принимаем код статуса OK или ERROR и краткий итог для SSH-приветствия.
+# Предупреждения о доставке записываем в журнал на Omega.
+publish_sync_status() {
+    publish_backup_status "$ALERT_FILE" "$1" "Синхронизация Incus" "$2" "${ALERT_NODES[@]}" \
+        2>&1 | tee -a "$LOG_FILE"
+}
+
+# Добавляем имя экземпляра к каждой непустой строке вывода команды.
+# Пустая строка не должна превращать успешный вызов Incus в сбой конвейера.
 log_cmd_output() {
     local prefix="$1"
     while IFS= read -r line; do
-        [ -n "$line" ] && log "[${prefix}] ${line}"
+        if [ -n "$line" ]; then
+            log "[${prefix}] ${line}"
+        fi
     done
 }
 
@@ -204,7 +228,12 @@ log "Целевые ноды источника: ${PROD_NODES[*]}"
 log "Таймауты: snapshot=${SNAPSHOT_TIMEOUT}, copy=${COPY_TIMEOUT}"
 log "======================================================================"
 
-mkdir -p "$ARCHIVE_DIR" "$CONFIG_DUMP_DIR"
+# Если целевые каталоги недоступны, публикуем ошибку до работы с экземплярами.
+if ! mkdir -p "$ARCHIVE_DIR" "$CONFIG_DUMP_DIR"; then
+    log "ОШИБКА: Не удалось подготовить каталоги хранения синхронизации."
+    publish_sync_status ERROR "не удалось подготовить каталоги хранения на Omega"
+    exit 2
+fi
 
 # ------------------------------------------------------------------------------
 # 1. Экспорт конфигураций кластера и простановка optional=true
@@ -242,15 +271,30 @@ log "[ШАГ 2/4] Получение списка инстансов из про
 
 NODES_JSON=$(printf '%s\n' "${PROD_NODES[@]}" | jq -R . | jq -s .)
 
-mapfile -t INSTANCES < <(
-    timeout 60s incus list --project "$SOURCE_PROJECT" --format=json | \
-    jq -r --argjson nodes "$NODES_JSON" \
-    '.[] | select(.location as $loc | $nodes | index($loc)) | "\(.name)|\(.type)|\(.location)"'
-)
+# Сначала проверяем результат запроса. mapfile сам не передаёт код команды внутри < <(...).
+if ! instance_rows=$(timeout 60s incus list --project "$SOURCE_PROJECT" --format=json | \
+    jq -r --argjson nodes "$NODES_JSON" '
+        if type != "array" then
+            error("Ожидался массив экземпляров Incus")
+        else
+            .[] | select(.location as $loc | $nodes | index($loc))
+            | "\(.name)|\(.type)|\(.location)"
+        end
+    '); then
+    log "ОШИБКА: Не удалось получить список инстансов из проекта ${SOURCE_PROJECT}."
+    publish_sync_status ERROR "не удалось получить список экземпляров проекта $SOURCE_PROJECT"
+    exit 2
+fi
+
+INSTANCES=()
+if [ -n "$instance_rows" ]; then
+    mapfile -t INSTANCES <<< "$instance_rows"
+fi
 
 TOTAL_COUNT=${#INSTANCES[@]}
 SUCCESS_COUNT=0
 FAIL_COUNT=0
+FAILURE_DETAILS=()
 
 log "Найдено инстансов для синхронизации: ${TOTAL_COUNT}"
 
@@ -259,8 +303,17 @@ for entry in "${INSTANCES[@]}"; do
     INST_START=$(date +%s)
     NEW_ANCHOR="${SNAP_PREFIX}${TIMESTAMP}"
     WAS_RUNNING=0
+    instance_failed=0
 
-    inst_status=$(timeout "$CLI_TIMEOUT" incus query "/1.0/instances/${inst_name}?project=${SOURCE_PROJECT}" | jq -r '.status')
+    # Если состояние источника неизвестно, пропускаем экземпляр до любых действий с ним.
+    if ! inst_status=$(timeout "$CLI_TIMEOUT" \
+        incus query "/1.0/instances/${inst_name}?project=${SOURCE_PROJECT}" | \
+        jq -er '.status | strings | select(length > 0)'); then
+        log "[${inst_name}] ОШИБКА: Не удалось определить состояние исходного экземпляра."
+        FAILURE_DETAILS+=("$inst_name — не удалось определить состояние источника")
+        ((FAIL_COUNT++))
+        continue
+    fi
 
     log "----------------------------------------------------------------------"
     log ">>> Обработка: ${inst_name} (Тип: ${inst_type}, Нода: ${inst_loc}, Статус: ${inst_status})"
@@ -296,17 +349,28 @@ for entry in "${INSTANCES[@]}"; do
         log "[${inst_name}] Штатная остановка инстанса (таймаут ${STOP_TIMEOUT}с)..."
         if ! timeout --kill-after=10s "$((STOP_TIMEOUT + 30))s" incus stop "$inst_name" --project "$SOURCE_PROJECT" --timeout "$STOP_TIMEOUT" 2>&1 | log_cmd_output "$inst_name"; then
             log "[${inst_name}] ВНИМАНИЕ: Не остановился за ${STOP_TIMEOUT}с, применяем --force..."
-            timeout --kill-after=5s 30s incus stop "$inst_name" --project "$SOURCE_PROJECT" --force 2>&1 | log_cmd_output "$inst_name" || true
+            if ! timeout --kill-after=5s 30s incus stop "$inst_name" --project "$SOURCE_PROJECT" \
+                --force 2>&1 | log_cmd_output "$inst_name"; then
+                log "[${inst_name}] ОШИБКА: Не удалось остановить экземпляр."
+                FAILURE_DETAILS+=("$inst_name — не удалось остановить источник")
+                instance_failed=1
+            fi
         fi
     fi
 
     log "[${inst_name}] Создание якорного снапшота ${NEW_ANCHOR} в проекте ${SOURCE_PROJECT}..."
     if ! timeout --kill-after=10s "$SNAPSHOT_TIMEOUT" incus snapshot create "$inst_name" "$NEW_ANCHOR" --project "$SOURCE_PROJECT" 2>&1 | log_cmd_output "$inst_name"; then
         log "[${inst_name}] ОШИБКА: Не удалось создать снапшот ${NEW_ANCHOR} на источнике (или превышен таймаут ${SNAPSHOT_TIMEOUT})."
+        FAILURE_DETAILS+=("$inst_name — не удалось создать якорный снапшот")
         if [ "$WAS_RUNNING" -eq 1 ]; then
             log "[${inst_name}] Возврат инстанса в состояние Running..."
-            timeout --kill-after=10s 60s incus start "$inst_name" --project "$SOURCE_PROJECT" 2>&1 | log_cmd_output "$inst_name" || true
-            CURRENT_STOPPED_INST=""
+            if timeout --kill-after=10s 60s incus start "$inst_name" --project "$SOURCE_PROJECT" \
+                2>&1 | log_cmd_output "$inst_name"; then
+                CURRENT_STOPPED_INST=""
+            else
+                log "[${inst_name}] КРИТИЧЕСКАЯ ОШИБКА: Не удалось запустить инстанс обратно!"
+                FAILURE_DETAILS+=("$inst_name — не удалось запустить источник обратно")
+            fi
         fi
         ((FAIL_COUNT++))
         continue
@@ -332,6 +396,7 @@ for entry in "${INSTANCES[@]}"; do
             --stateless 2>&1 | log_cmd_output "$inst_name"; then
             COPY_OK=0
             log "[${inst_name}] ОШИБКА: Повторное копирование также завершилось сбоем (или превышен таймаут ${COPY_TIMEOUT})!"
+            FAILURE_DETAILS+=("$inst_name — повторное копирование завершилось сбоем")
             timeout --kill-after=5s "$CLI_TIMEOUT" incus snapshot delete "$inst_name" "$NEW_ANCHOR" --project "$SOURCE_PROJECT" >/dev/null 2>&1 || true
         else
             log "[${inst_name}] SELF-HEAL: Целевая копия в ${BACKUP_PROJECT} успешно пересоздана с нуля."
@@ -344,6 +409,8 @@ for entry in "${INSTANCES[@]}"; do
             CURRENT_STOPPED_INST=""
         else
             log "[${inst_name}] КРИТИЧЕСКАЯ ОШИБКА: Не удалось запустить инстанс обратно!"
+            FAILURE_DETAILS+=("$inst_name — не удалось запустить источник обратно")
+            instance_failed=1
         fi
     fi
 
@@ -391,15 +458,24 @@ for entry in "${INSTANCES[@]}"; do
         if btrfs subvolume snapshot -r "$SUBVOL_SRC" "$ARCHIVE_SNAP_PATH" 2>&1 | log_cmd_output "$inst_name"; then
             log "[${inst_name}] Архивный read-only Btrfs-снапшот создан: ${ARCHIVE_SNAP_PATH}"
         else
-            log "[${inst_name}] ВНИМАНИЕ: Не удалось создать Btrfs-снапшот из ${SUBVOL_SRC}"
+            log "[${inst_name}] ОШИБКА: Не удалось создать Btrfs-снапшот из ${SUBVOL_SRC}"
+            FAILURE_DETAILS+=("$inst_name — не удалось создать архивный Btrfs-снапшот")
+            instance_failed=1
         fi
     else
-        log "[${inst_name}] ВНИМАНИЕ: Сабвольюм ${SUBVOL_SRC} не найден!"
+        log "[${inst_name}] ОШИБКА: Сабвольюм ${SUBVOL_SRC} не найден!"
+        FAILURE_DETAILS+=("$inst_name — отсутствует сабволюм копии")
+        instance_failed=1
     fi
 
-    INST_DURATION=$(( $(date +%s) - INST_START ))
-    log "[${inst_name}] УСПЕШНО синхронизирован за ${INST_DURATION} сек."
-    ((SUCCESS_COUNT++))
+    # Учитываем каждый экземпляр один раз, даже если у него несколько ошибок.
+    if [ "$instance_failed" -eq 1 ]; then
+        ((FAIL_COUNT++))
+    else
+        INST_DURATION=$(( $(date +%s) - INST_START ))
+        log "[${inst_name}] УСПЕШНО синхронизирован за ${INST_DURATION} сек."
+        ((SUCCESS_COUNT++))
+    fi
 done
 
 # ------------------------------------------------------------------------------
@@ -432,20 +508,16 @@ log "======================================================================"
 log "ЗАВЕРШЕНО за ${TOTAL_DURATION} сек. Успешно: ${SUCCESS_COUNT}/${TOTAL_COUNT}, Ошибок: ${FAIL_COUNT}"
 log "======================================================================"
 
+# Сохраняем итог любого завершённого прохода, включая успешную синхронизацию.
+# Приветствие показывает до трёх причин, подробности остаются в журнале на Omega.
+details="экземпляров синхронизировано $SUCCESS_COUNT из $TOTAL_COUNT, ошибок $FAIL_COUNT"
 if [ "$FAIL_COUNT" -gt 0 ]; then
-    cat <<EOF > "$ALERT_FILE"
-  Дата сбоя: $(date '+%Y-%m-%d %H:%M:%S')
-  Успешно:   ${SUCCESS_COUNT}/${TOTAL_COUNT}
-  Ошибок:    ${FAIL_COUNT} (см. инстансы с меткой ОШИБКА в /var/log/incus-backup-sync.log на OMEGA)
-EOF
-    for node in "${ALERT_NODES[@]}"; do
-        scp -o BatchMode=yes -o ConnectTimeout=5 "$ALERT_FILE" "root@${node}:${ALERT_FILE}" 2>/dev/null || true
+    for reason in "${FAILURE_DETAILS[@]:0:3}"; do
+        details+=" · $reason"
     done
+    publish_sync_status ERROR "$details"
     exit 2
-else
-    rm -f "$ALERT_FILE"
-    for node in "${ALERT_NODES[@]}"; do
-        ssh -o BatchMode=yes -o ConnectTimeout=5 "root@${node}" "rm -f ${ALERT_FILE}" 2>/dev/null || true
-    done
-    exit 0
 fi
+
+publish_sync_status OK "$details"
+exit 0
