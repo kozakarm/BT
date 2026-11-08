@@ -4,7 +4,7 @@
 # Проверяем хранилище, сохраняем конфигурацию и по очереди обновляем архивы.
 # Работающие экземпляры в backup останавливаем и оставляем остановленными.
 # Нужны Incus CLI, jq, findmnt, flock, GNU coreutils и доступный компрессор
-# из списка zstd, pigz, xz, gzip.
+# из списка zstd, pigz, xz, gzip. Для доставки статуса используем scp и ssh.
 
 # pipefail позволяет обнаружить сбой Incus или компрессора при потоковом экспорте.
 set -uo pipefail
@@ -35,6 +35,11 @@ MIN_FREE_BYTES=1000000000000
 # Путь к локальному файлу блокировки от параллельного запуска экспортёра.
 LOCK_FILE="/run/lock/bt-incus-backup.lock"
 
+# Последний результат экспорта на Omega и ноды для его доставки.
+STATUS_FILE="/var/log/incus-backup-export-status.txt"
+STATUS_NODES=("xi.lan" "sigma.lan")
+STATUS_OPERATION="Экспорт проекта $BACKUP_PROJECT"
+
 # Число потоков сжатия для zstd, pigz и xz. Резервный gzip работает в один поток.
 COMPRESSION_THREADS=3
 
@@ -45,9 +50,14 @@ STOP_TIMEOUT=120
 # ==========================================
 # Общие проверки и завершение запуска
 # ==========================================
-# Печатаем переданное сообщение в поток ошибок и завершаем весь запуск с кодом 1.
+# После захвата блокировки публикуем ранние сбои, например недоступное хранилище.
+# При повторном запуске с занятой блокировкой остаётся результат предыдущего прохода.
+status_active=false
 fail() {
     printf 'ОШИБКА: %s\n' "$*" >&2
+    if [[ "$status_active" == true ]]; then
+        publish_backup_status "$STATUS_FILE" ERROR "$STATUS_OPERATION" "$*" "${STATUS_NODES[@]}"
+    fi
     exit 1
 }
 
@@ -188,6 +198,7 @@ backup_instance() (
 
     # Проект backup предназначен для остановленных копий.
     # Если экземпляр работает, останавливаем его и оставляем остановленным после экспорта.
+    # Коды выхода 2–7 передают этап сбоя в итоговый статус запуска.
     if [[ "$status" != Stopped ]]; then
         printf '[%s] Останавливаем экземпляр в проекте %s.\n' "$instance" "$BACKUP_PROJECT"
 
@@ -197,7 +208,7 @@ backup_instance() (
         if ! timeout --kill-after=10s "${stop_wait_seconds}s" \
             incus --force-local stop "$instance" --project "$BACKUP_PROJECT" --timeout "$STOP_TIMEOUT"; then
             printf 'ОШИБКА [%s]: не удалось остановить экземпляр.\n' "$instance" >&2
-            exit 1
+            exit 2
         fi
     fi
 
@@ -212,7 +223,7 @@ backup_instance() (
 
     # Пишем в файл .part рядом с готовым архивом. При ошибке обработчик EXIT удалит .part.
     if ! temporary=$(mktemp -- "${archive}.part.XXXXXX"); then
-        exit 1
+        exit 3
     fi
     trap 'rm -f -- "$temporary"' EXIT
 
@@ -222,25 +233,25 @@ backup_instance() (
     if ! incus --force-local export "$instance" - --quiet --project "$BACKUP_PROJECT" \
         --instance-only --compression=none | "${COMPRESSOR[@]}" > "$temporary"; then
         printf 'ОШИБКА [%s]: сбой экспорта или сжатия.\n' "$instance" >&2
-        exit 1
+        exit 4
     fi
 
     # Проверяем размер, сбрасываем данные на диск и заменяем архив переименованием.
     if [[ ! -s "$temporary" ]]; then
-        exit 1
+        exit 5
     fi
     if ! sync -d -- "$temporary"; then
-        exit 1
+        exit 5
     fi
     if ! mv -fT -- "$temporary" "$archive"; then
-        exit 1
+        exit 6
     fi
 
     # При совпадении формата переименование уже заменило предыдущий архив.
     # При смене формата удаляем одну предыдущую копию после сохранения новой.
     if [[ -n "$previous" && "$previous" != "$archive" ]]; then
         if ! rm -- "$previous"; then
-            exit 1
+            exit 7
         fi
     fi
     printf '[%s] Архив сохранён в %s.\n' "$instance" "$archive"
@@ -249,12 +260,19 @@ backup_instance() (
 # ==========================================
 # Основной проход
 # ==========================================
-# Проверяем хост и хранилище перед обращением к Incus и созданием архивов.
+# Проверяем хост перед обращением к Incus и записью результатов.
 current_host=$(hostname -s)
 if [[ "$current_host" != omega ]]; then
     fail "Запускайте экспортёр на Omega."
 fi
-check_destination
+# При запуске через симлинк ищем файл функций рядом с оригиналом скрипта.
+if ! script_path=$(readlink -f -- "${BASH_SOURCE[0]}"); then
+    fail "Не удалось определить путь к скрипту."
+fi
+script_directory=${script_path%/*}
+if ! source "$script_directory/incus-backup-status.sh"; then
+    fail "Не удалось загрузить функции оповещения."
+fi
 
 # Открываем файл блокировки как дескриптор 9 и удерживаем его до завершения работы.
 # flock с флагом -n проверяет блокировку сразу и не ждёт завершения другого запуска.
@@ -264,6 +282,8 @@ fi
 if ! flock -n 9; then
     fail "Другой процесс уже выполняет экспорт Incus."
 fi
+status_active=true
+check_destination
 
 # Выбираем доступный компрессор и расширение в порядке предпочтения.
 # Массив хранит команду и аргументы отдельно для безопасного вызова.
@@ -311,6 +331,7 @@ fi
 # Обрабатываем экземпляры по очереди. Ошибка одного архива не прерывает обход.
 success_count=0
 failure_count=0
+failure_details=()
 while IFS=$'\t' read -r instance instance_type status; do
     if [[ -z "$instance" ]]; then
         continue
@@ -325,6 +346,7 @@ while IFS=$'\t' read -r instance instance_type status; do
             ;;
         *)
             printf 'ОШИБКА [%s]: неизвестный тип экземпляра %s.\n' "$instance" "$instance_type" >&2
+            failure_details+=("$instance — неизвестный тип $instance_type")
             ((failure_count += 1))
             continue
             ;;
@@ -333,15 +355,35 @@ while IFS=$'\t' read -r instance instance_type status; do
     if backup_instance "$instance" "$directory" "$status"; then
         ((success_count += 1))
     else
-        printf 'ОШИБКА [%s]: резервное копирование завершилось с ошибкой.\n' "$instance" >&2
+        case "$?" in
+            2) failure_reason="не удалось остановить экземпляр" ;;
+            3) failure_reason="не удалось создать временный файл" ;;
+            4) failure_reason="сбой экспорта или сжатия" ;;
+            5) failure_reason="пустой архив или ошибка записи" ;;
+            6) failure_reason="не удалось заменить архив" ;;
+            7) failure_reason="не удалось удалить предыдущий архив" ;;
+            *) failure_reason="неизвестный сбой" ;;
+        esac
+        printf 'ОШИБКА [%s]: %s.\n' "$instance" "$failure_reason" >&2
+        failure_details+=("$instance — $failure_reason")
         ((failure_count += 1))
     fi
 done <<< "$instances"
 
-# Печатаем итог и возвращаем код 0, если все экземпляры и дампы обработаны успешно.
+# Печатаем итог и сохраняем статус. Ошибка доставки не меняет результат экспорта.
 printf 'Экспорт Incus завершён. Архивов обновлено: %d. Ошибок экземпляров: %d. Ошибка конфигурации: %d.\n' \
     "$success_count" "$failure_count" "$configuration_failed"
+details="архивов обновлено $success_count, ошибок экземпляров $failure_count"
+if (( configuration_failed != 0 )); then
+    details+=" · неполный дамп конфигурации"
+fi
 if (( failure_count > 0 || configuration_failed != 0 )); then
+    # Для приветствия достаточно трёх причин. Остальные остаются в выводе скрипта.
+    for reason in "${failure_details[@]:0:3}"; do
+        details+=" · $reason"
+    done
+    publish_backup_status "$STATUS_FILE" ERROR "$STATUS_OPERATION" "$details" "${STATUS_NODES[@]}"
     exit 1
 fi
+publish_backup_status "$STATUS_FILE" OK "$STATUS_OPERATION" "$details" "${STATUS_NODES[@]}"
 exit 0
