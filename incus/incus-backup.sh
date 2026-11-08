@@ -34,6 +34,8 @@ MIN_FREE_BYTES=1000000000000
 
 # Путь к локальному файлу блокировки от параллельного запуска экспортёра.
 LOCK_FILE="/run/lock/bt-incus-backup.lock"
+# Код flock для штатного конфликта с уже запущенной операцией.
+LOCK_BUSY_CODE=75
 
 # Последний результат экспорта на Omega и ноды для его доставки.
 STATUS_FILE="/var/log/incus-backup-export-status.txt"
@@ -260,6 +262,15 @@ backup_instance() (
 # ==========================================
 # Основной проход
 # ==========================================
+# Плановый запуск проверяет недельную отметку. Ручной запуск без аргументов
+# выполняет экспорт отдельно и не обновляет эту отметку.
+scheduled=false
+if [[ "$#" -eq 1 && "$1" == --scheduled ]]; then
+    scheduled=true
+elif [[ "$#" -ne 0 ]]; then
+    fail "Использование: incus-backup.sh [--scheduled]"
+fi
+
 # Проверяем хост перед обращением к Incus и записью результатов.
 current_host=$(hostname -s)
 if [[ "$current_host" != omega ]]; then
@@ -279,9 +290,40 @@ fi
 if ! exec 9>"$LOCK_FILE"; then
     fail "Не удалось открыть $LOCK_FILE."
 fi
-if ! flock -n 9; then
-    fail "Другой процесс уже выполняет экспорт Incus."
+flock -n -E "$LOCK_BUSY_CODE" 9
+lock_result=$?
+if [[ "$lock_result" -eq "$LOCK_BUSY_CODE" && "$scheduled" == true ]]; then
+    printf '%s\n' 'Плановый экспорт отложен. Общая блокировка занята.'
+    exit 0
 fi
+if [[ "$lock_result" -eq "$LOCK_BUSY_CODE" ]]; then
+    fail "Общую блокировку уже держит другой процесс."
+fi
+if [[ "$lock_result" -ne 0 ]]; then
+    fail "Не удалось захватить общую блокировку. Код flock $lock_result."
+fi
+
+# Сверяем и записываем отметку под общей блокировкой, чтобы cron видел её
+# только тогда, когда экспортёр действительно получил право начать работу.
+if [[ "$scheduled" == true ]]; then
+    if ! source "$script_directory/incus-backup-schedule.sh"; then
+        fail "Не удалось загрузить проверку недельного расписания."
+    fi
+    scheduled_day=$(backup_week_pending)
+    schedule_result=$?
+    if [[ "$schedule_result" -eq 1 ]]; then
+        printf '%s\n' 'Плановая попытка за эту неделю уже началась.'
+        exit 0
+    fi
+    if [[ "$schedule_result" -ne 0 ]]; then
+        fail "Не удалось проверить недельную отметку."
+    fi
+    if ! record_backup_week_attempt "$scheduled_day"; then
+        fail "Не удалось записать начало плановой попытки за $scheduled_day."
+    fi
+    printf 'Начинаем плановую попытку экспорта за %s.\n' "$scheduled_day"
+fi
+
 status_active=true
 check_destination
 

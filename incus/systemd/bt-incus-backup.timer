@@ -1,0 +1,14 @@
+[Unit]
+Description=Weekly Incus export schedule on Omega
+
+[Timer]
+# Субботнее расписание также используется в incus-backup-schedule.sh.
+OnCalendar=Sat *-*-* 09:00:00 Europe/Paris
+Persistent=true
+AccuracySec=1s
+# При загрузке сверяем недельную отметку, даже если таймер уже вызвал сервис.
+OnBootSec=30s
+Unit=bt-incus-backup.service
+
+[Install]
+WantedBy=timers.target
