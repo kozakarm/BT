@@ -1,6 +1,6 @@
 #!/bin/sh
 
-# Показываем на интерактивном SSH-входе последние результаты двух операций Incus.
+# Показываем на интерактивном SSH-входе последний результат синхронизации Incus.
 # Читаем текстовые файлы в /var/log. Цвет добавляем только при выводе в терминал.
 
 # Скобки ограничивают видимость переменных и функций этим приветствием.
@@ -13,13 +13,10 @@
         exit 0
     fi
 
-    # Синхронизация и экспорт хранят последний результат в отдельных файлах.
     sync_status_file="/var/log/incus-backup-alert.txt"
-    export_status_file="/var/log/incus-backup-export-status.txt"
 
-    # Первый аргумент задаёт путь к статусу, второй разрешает прежний формат
-    # ошибки синхронизации. Современный файл содержит код OK или ERROR и строку
-    # сообщения. Старый файл синхронизации содержит только текст ошибки.
+    # Аргумент задаёт путь к статусу. Файл содержит код OK или ERROR и сообщение.
+    # Старый формат с текстом ошибки тоже читаем.
     render_backup_status() {
         if [ ! -s "$1" ] || [ ! -r "$1" ]; then
             return 0
@@ -34,11 +31,9 @@
                 ERROR) backup_color='\033[1;31m' ;;
                 *)
                     # Действующая синхронизация ещё может записать старый формат.
-                    if [ "$2" = legacy ]; then
-                        printf '\033[1;31m%s\n%s\n' 'Синхронизация Incus — ошибка' "$backup_status"
-                        cat
-                        printf '%s\033[0m\n' 'Журнал на Omega — /var/log/incus-backup-sync.log'
-                    fi
+                    printf '\033[1;31m%s\n%s\n' 'Синхронизация Incus — ошибка' "$backup_status"
+                    cat
+                    printf '%s\033[0m\n' 'Журнал на Omega — /var/log/incus-backup-sync.log'
                     return 0
                     ;;
             esac
@@ -50,6 +45,5 @@
         } < "$1"
     }
 
-    render_backup_status "$sync_status_file" legacy
-    render_backup_status "$export_status_file" current
+    render_backup_status "$sync_status_file"
 )

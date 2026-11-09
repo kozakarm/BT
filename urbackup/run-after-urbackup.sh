@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==============================================================================
 # Обрабатываем триггер завершения UrBackup на Omega.
-# С общей блокировкой останавливаем urbackupsrv и запускаем синхронизацию Incus.
+# Под блокировкой обработчика останавливаем urbackupsrv и запускаем синхронизацию Incus.
 # После завершённой попытки удаляем триггер и отправляем нодам команды выключения.
 # Нужны flock, systemctl, ssh и установленный скрипт синхронизации.
 # ==============================================================================
@@ -19,12 +19,10 @@ SHUTDOWN_NODES=(
 # UrBackup создаёт этот файл, когда можно начинать синхронизацию.
 TRIGGER_FILE="/var/urbackup/shutdown_now"
 
-# Используем тот же файл блокировки, что и incus-backup.sh.
-LOCK_FILE="/run/lock/bt-incus-backup.lock"
+# Не даём двум вызовам cron одновременно обработать один триггер.
+LOCK_FILE="/run/lock/bt-urbackup-handler.lock"
 # flock вернёт этот код, если блокировку уже держит другой процесс.
 LOCK_BUSY_CODE=75
-# Этот сервис запускает плановую попытку экспорта на Omega.
-EXPORT_SERVICE="bt-incus-backup.service"
 
 # Хранилище использовалось в оставленном ниже блоке дедупликации.
 URBACKUP_POOL="/opt/urbackup-pool"
@@ -53,7 +51,7 @@ fi
 flock -n -E "$LOCK_BUSY_CODE" 9
 lock_result=$?
 if [ "$lock_result" -eq "$LOCK_BUSY_CODE" ]; then
-    # Cron повторит проверку, когда экспортёр или другой обработчик освободит блокировку.
+    # Cron повторит проверку, когда другой обработчик освободит блокировку.
     exit 0
 fi
 if [ "$lock_result" -ne 0 ]; then
@@ -64,36 +62,6 @@ fi
 # Другой запуск мог обработать триггер между первой проверкой и захватом блокировки.
 if [ ! -e "$TRIGGER_FILE" ]; then
     exit 0
-fi
-
-# Читаем недельную отметку под той же блокировкой, которую берёт экспортёр.
-# readlink разрешает рабочий симлинк из /usr/local/bin.
-if ! script_path=$(readlink -f -- "${BASH_SOURCE[0]}"); then
-    echo "ОШИБКА: Не удалось определить путь к обработчику UrBackup."
-    exit 1
-fi
-script_directory=${script_path%/*}
-if ! source "$script_directory/../incus/incus-backup-schedule.sh"; then
-    echo "ОШИБКА: Не удалось загрузить проверку недельного расписания."
-    exit 1
-fi
-
-scheduled_day=$(backup_week_pending)
-schedule_result=$?
-if [ "$schedule_result" -eq 0 ]; then
-    # Освобождаем дескриптор перед постановкой задачи, иначе экспортёр встретит занятую блокировку.
-    # --no-block ставит сервис в очередь. Cron позже проверит оставленный триггер.
-    exec 9>&-
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Сначала нужен плановый экспорт за $scheduled_day."
-    if ! systemctl --no-block start "$EXPORT_SERVICE"; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ОШИБКА: Не удалось поставить плановый экспорт в очередь."
-        exit 1
-    fi
-    exit 0
-fi
-if [ "$schedule_result" -ne 1 ]; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ОШИБКА: Не удалось проверить недельную отметку. Триггер сохранён."
-    exit 1
 fi
 
 echo "======================================================================"
@@ -154,4 +122,4 @@ sleep 5
 
 # 5. Выключение Omega временно отключено для отладки.
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Автоматическое выключение Omega отключено для отладки."
-#shutdown -h now
+shutdown -h now

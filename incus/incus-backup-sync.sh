@@ -51,23 +51,58 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
 }
 
-# При запуске через симлинк ищем функции оповещения рядом с оригиналом скрипта.
-if ! script_path=$(readlink -f -- "${BASH_SOURCE[0]}"); then
-    log "ОШИБКА: Не удалось определить путь к скрипту."
-    exit 2
-fi
-script_directory=${script_path%/*}
-if ! source "$script_directory/incus-backup-status.sh"; then
-    log "ОШИБКА: Не удалось загрузить функции оповещения."
-    exit 2
-fi
+# Принимаем OK или ERROR и краткий итог синхронизации.
+# Сначала атомарно сохраняем статус на Omega, затем публикуем его на каждой ноде.
+publish_sync_status() (
+    local state="$1" details="$2" result completed_at temporary
+    local receiver remote_command node
+    local ssh_options=(-o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=yes)
 
-# Принимаем код статуса OK или ERROR и краткий итог для SSH-приветствия.
-# Предупреждения о доставке записываем в журнал на Omega.
-publish_sync_status() {
-    publish_backup_status "$ALERT_FILE" "$1" "Синхронизация Incus" "$2" "${ALERT_NODES[@]}" \
-        2>&1 | tee -a "$LOG_FILE"
-}
+    case "$state" in
+        OK) result="успешно" ;;
+        ERROR) result="ошибка" ;;
+        *) exit 2 ;;
+    esac
+    if ! completed_at=$(TZ=Europe/Paris date '+%d.%m.%Y %H:%M:%S %Z'); then
+        log "ВНИМАНИЕ: не удалось определить время завершения синхронизации."
+        exit 1
+    fi
+    if ! temporary=$(mktemp -- "${ALERT_FILE}.part.XXXXXX"); then
+        log "ВНИМАНИЕ: не удалось подготовить файл статуса $ALERT_FILE."
+        exit 1
+    fi
+    trap 'rm -f -- "$temporary"' EXIT
+    if ! printf '%s\nСинхронизация Incus — %s · %s · %s\n' \
+        "$state" "$result" "$completed_at" "$details" > "$temporary"; then
+        log "ВНИМАНИЕ: не удалось записать статус $ALERT_FILE."
+        exit 1
+    fi
+    if ! chmod 0644 -- "$temporary" || ! mv -fT -- "$temporary" "$ALERT_FILE"; then
+        log "ВНИМАНИЕ: не удалось опубликовать статус $ALERT_FILE на Omega."
+        exit 1
+    fi
+
+    # Передаём содержимое через stdin за одно SSH-соединение. На приёмнике
+    # прежний статус заменяется только после успешной записи временного файла.
+    receiver=$(cat <<'REMOTE'
+set -e
+destination="$1"
+temporary=$(mktemp -- "${destination}.part.XXXXXX")
+trap 'rm -f -- "$temporary"' EXIT
+cat > "$temporary"
+test -s "$temporary"
+chmod 0644 -- "$temporary"
+mv -fT -- "$temporary" "$destination"
+REMOTE
+)
+    printf -v remote_command 'bash -c %q -- %q' "$receiver" "$ALERT_FILE"
+    for node in "${ALERT_NODES[@]}"; do
+        if ! timeout --kill-after=5s 20s ssh "${ssh_options[@]}" "root@$node" \
+            "$remote_command" < "$ALERT_FILE" 2>> "$LOG_FILE"; then
+            log "ВНИМАНИЕ: не удалось передать статус синхронизации на $node."
+        fi
+    done
+)
 
 # Добавляем имя экземпляра к каждой непустой строке вывода команды.
 # Пустая строка не должна превращать успешный вызов Incus в сбой конвейера.
